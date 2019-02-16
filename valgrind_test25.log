@@ -1,0 +1,15 @@
+==4909== Memcheck, a memory error detector
+==4909== Copyright (C) 2002-2015, and GNU GPL'd, by Julian Seward et al.
+==4909== Using Valgrind-3.11.0 and LibVEX; rerun with -h for copyright info
+==4909== Command: ./wordcount_m1r1 /u/c/s/cs537-1/ta/tests/4a-new/inputs/xaa
+==4909== Parent PID: 4908
+==4909== 
+==4909== 
+==4909== HEAP SUMMARY:
+==4909==     in use at exit: 0 bytes in 0 blocks
+==4909==   total heap usage: 6,215,891 allocs, 6,215,891 frees, 241,707,434 bytes allocated
+==4909== 
+==4909== All heap blocks were freed -- no leaks are possible
+==4909== 
+==4909== For counts of detected and suppressed errors, rerun with: -v
+==4909== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)

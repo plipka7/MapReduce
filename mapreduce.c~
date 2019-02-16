@@ -1,0 +1,362 @@
+#include "mapreduce.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <pthread.h>
+
+/*bst for the partitions*/
+typedef struct bst_node bst_node;
+typedef struct v_node v_node;
+struct v_node{
+  char* value;
+  v_node* next;
+};
+struct bst_node{
+  char* key;
+  v_node* v_head; //linked list of values
+  bst_node* left;
+  bst_node* right;
+  bst_node* parent;
+};
+bst_node** cur_low;  //stores the current lowest key value
+bst_node** last_low; //stores the last lowest key value (for mem freeing)
+bst_node** bst_heads; //bst heads of the partitions
+int num_partitions;
+char* get_next_value(char *key, int partition_number);
+char* get_next_key(int partition_num);
+pthread_mutex_t* bst_locks;
+void add_to_tree(int part_num, char* key, char* value);
+void value_push(bst_node* node, char* value);
+void free_node(bst_node* node);
+
+/*Functions that will be used by threads. Their
+  definitions are dependent on arguments to MR_Run.*/
+Mapper mapper;
+Reducer reducer;
+Partitioner parter;
+
+/*Mapper info*/
+void* map_thread(void* args);
+volatile int current_file = 0;
+char** files;
+pthread_mutex_t files_lock = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t  get_file = PTHREAD_COND_INITIALIZER;
+
+/*Reducer thread*/
+void* reduce_thread(void* args);
+
+/*Adds the intermediate key, value pairs
+  produced by the user map function into 
+  the bst of the correct partition.*/
+void
+MR_Emit(char *key, char *value)
+{
+  /*Check for valid arguments.*/
+  if(key == NULL || value == NULL){
+    printf("invalid args to MR_Emit\n");
+    exit(1);
+  }
+
+  /*Determine the partition number for this key.*/
+  int part = parter(key, num_partitions);
+  
+  /*Grab the appropriate partition lock and
+    add the value to the bst*/
+  pthread_mutex_lock(&bst_locks[part]);
+  add_to_tree(part, key, value);
+  pthread_mutex_unlock(&bst_locks[part]);
+  return;
+}
+
+/*The "master" function. Creates the threads, the
+  global data structures to be used, and waits for
+  all the threads to do their work before returning.*/
+void
+MR_Run(int argc, char* argv[],
+       Mapper map, int num_mappers,
+       Reducer reduce, int num_reducers,
+       Partitioner partition)
+{
+  pthread_t threads[num_reducers+num_mappers];
+  num_partitions = num_reducers;
+  int partition_nums[num_partitions];
+ 
+  /*Check for valid arguments.*/
+  if(argc <= 1 || map == NULL || num_mappers <= 0 ||
+     reduce == NULL || num_reducers <= 0) {
+    printf("invalid arguments\n");
+    exit(1);
+  }
+
+  /*Set file info*/
+  files = malloc(sizeof(char*)*argc);
+  for(int i = 1; i < argc; i++)
+    files[i] = argv[i];
+  files[argc] = NULL;
+  
+  /*Set the function values*/
+  mapper = map;
+  reducer = reduce;
+  if(partition == NULL)
+    parter = MR_DefaultHashPartition;
+  else
+    parter = partition;
+
+  /*Initialize the bst_locks*/
+  bst_locks = malloc(sizeof(pthread_mutex_t)*num_reducers);
+  for(int i = 0; i < num_reducers; i++)
+    pthread_mutex_init(&bst_locks[i], NULL);
+
+  /*Initialize the bst*/
+  bst_heads = malloc(sizeof(bst_node*)*num_reducers);
+  cur_low  = malloc(sizeof(bst_node*)*num_reducers);
+  last_low = malloc(sizeof(bst_node*)*num_reducers);
+  for(int i = 0; i < num_reducers; i++) {
+    bst_heads[i] = NULL;
+    cur_low[i]  = NULL;
+    last_low[i] = NULL;
+  }
+  
+  /*Create the mapper threads and wait for them to finish*/
+  for(int i = 0; i < num_mappers; i++)
+    pthread_create(&(threads[i]), NULL, map_thread, NULL);
+  for(int i = 0; i < num_mappers; i++)
+    pthread_join(threads[i], NULL);
+
+  /*Create and wait for the reducer functions. Give each thread
+    a unique partition number*/
+  for(int i = 0; i < num_reducers; i++){
+    partition_nums[i] = i;
+    pthread_create(&(threads[i]), NULL, reduce_thread, &partition_nums[i]);
+  }
+  for(int i = 0; i < num_reducers; i++)
+    pthread_join(threads[i], NULL);
+
+  /*Free allocated memory and return*/
+  free(cur_low);
+  free(last_low);
+  free(bst_heads);
+  free(files);
+  free(bst_locks);
+  return;
+}
+
+/*Mapper thread. Simply gets the next file to be processed
+  and passes it into the user defined map function.*/
+void*
+map_thread(void* args)
+{
+  char* file; //next file to work on
+  while(1) {
+    pthread_mutex_lock(&files_lock);
+    if((file = files[current_file++]) == NULL)
+      return NULL;
+    pthread_mutex_unlock(&files_lock);
+    mapper(file);
+  }
+}
+
+/*Reducer thread. Simply gets the next low key value and 
+  calls the user defined reducer function on it with our
+  get_next_value function passed in.*/
+void*
+reduce_thread(void* args)
+{
+  int local_part = *(int*)args; //passed in partition#
+  char* next_key;
+  while(1) {
+    /*Each reducer has been given a unique partition
+      number, so locks aren't needed. Give it the lowest
+      current key in the partition.*/
+    if((next_key = get_next_key(local_part)) == NULL)
+      return NULL;
+    reducer(next_key, get_next_value, local_part);
+  }
+}
+
+/*Partioner that will be used if the user doesn't specify one*/
+unsigned long
+MR_DefaultHashPartition(char *key, int num_partitions) {
+  unsigned long hash = 5381;
+  int c;
+  while ((c = *key++) != '\0')
+    hash = hash * 33 + c;
+  return hash % num_partitions;
+}
+
+/*By the design of this program, the key should always be
+  equal to low_key[partition_num], so the key value passed
+  in is useless.*/
+char*
+get_next_value(char *key, int partition_num)
+{
+  char* return_value;
+
+  /*static pointers to keep track of the location in
+    the key value lists*/
+  static v_node* cur_locs[num_partitions] = NULL;
+  static int new_node[num_partitions];
+  if(cur_locs == NULL) 
+    memset(new_node, 1, sizeof(int)*num_partitions);
+
+  if(new_node[partition_num]) {
+    new_node[partition_num] = 0;
+    cur_locs[partition_num] = cur_low[partition_num]->v_head;
+    if(cur_locs[partition_num] == NULL) {
+      printf("shouldn't happen. Fatal error.\n");
+      return NULL;
+    }
+  }
+  return_value = cur_locs[partition_num]->value;
+  if(cur_locs[partition_num]->next != NULL) {
+    cur_locs[partition_num] = cur_locs[partition_num]->next;
+    return return_value;
+  }
+  new_node[partition_num] = 1;
+  return return_value;
+}
+
+/*Returns the lowest key left for a particular partition.
+  We already have a pointer to this item when we enter this
+  function, so all of the work is adjusting the pointer.*/
+char*
+get_next_key(int partition_num)
+{
+  char* return_key = cur_low[partition_num]->key;
+
+  /*Check if we need to free memory*/
+  if(last_low[partition_num] != NULL) {
+    free_node(last_low[partition_num]);
+    last_low[partition_num] = cur_low[partition_num];
+  }
+
+  /*Find the new value of cur_low*/
+  /*Worst cast for searching*/
+  if(cur_low[partition_num]->right != NULL) {
+    cur_low[partition_num] = cur_low[partition_num]->right;
+    while(cur_low[partition_num]->left != NULL)
+      cur_low[partition_num] = cur_low[partition_num]->left;
+  }
+  /*Best case*/
+  else if(cur_low[partition_num]->right == NULL
+	  && cur_low[partition_num]->left == NULL) {
+    cur_low[partition_num] = cur_low[partition_num]->parent;
+  }
+  /*Worster case (fatal error).*/
+  else{
+    printf("This should never happen. The whole program is screwed.\n");
+    exit(1);
+  }
+  return return_key;
+}
+
+/*Adds the key, value pair to the bst tree for the partition number.*/
+void
+add_to_tree(int part_num, char* key, char* value)
+{
+  bst_node* parent_node = bst_heads[part_num];
+  bst_node* new_node = malloc(sizeof(bst_node));
+  new_node->v_head = NULL;
+  new_node->left = NULL;
+  new_node->right = NULL;
+  new_node->parent = NULL;
+
+  /*Set the new node as the head.*/
+  if(parent_node == NULL) {
+    new_node->key = malloc(sizeof(char)*(strlen(key)+1));
+    strcpy(new_node->key, key);
+    cur_low[part_num] = new_node; //this is the lowest key in the partition
+    bst_heads[part_num] = new_node; //and the head
+    value_push(new_node, value);
+  }
+
+  while(1) {
+    /*we already have a node for the key, merge in the value.*/
+    if(strcmp(key, parent_node->key) == 0) {
+      free(new_node); //don't need it
+      value_push(parent_node, value);
+    }
+
+    /*Key value is lower than the current search node.*/
+    else if(strcmp(key, parent_node->key) < 0) {
+      /*Found the new parent of the added node*/
+      if(parent_node->left == NULL) {
+	/*Check if this is the new low value.*/
+	if(parent_node == cur_low[part_num])
+	  cur_low[part_num] = new_node;
+
+	/*Add the new node as the left child of the parent node.*/
+	parent_node->left = new_node;
+	new_node->key = malloc(sizeof(char)*(strlen(key)+1));
+	strcpy(new_node->key, key);
+	new_node->parent = parent_node;
+	value_push(new_node, value);
+	return;
+      }
+      /*Keep searching*/
+      else {
+	parent_node = parent_node->left;
+	continue;
+      }
+    }
+    /*Key value is higher than the current search node.*/
+    else{
+      /*Found the new parent of the added node*/
+      if(parent_node->right == NULL) {
+	/*Add the new node as the right child of the parent node.*/
+	parent_node->right = new_node;
+	new_node->key = malloc(sizeof(char)*(strlen(key)+1));
+	strcpy(new_node->key, key);
+	new_node->parent = parent_node;
+	value_push(new_node, value);
+	return;
+      }
+      /*Keep searching*/
+      else {
+	parent_node = parent_node->right;
+	continue;
+      }
+    }
+  }
+}
+
+/*Push a new value onto the value list for a key node.*/
+void
+value_push(bst_node* node, char* value)
+{
+  /*Allocate the memory for the new value.*/
+  v_node* new_value = malloc(sizeof(v_node));
+  new_value->value = malloc(sizeof(char)*(strlen(value)+1));
+  strcpy(new_value->value, value);
+  
+  /*Value list for this key is empty*/
+  if(node->v_head == NULL) {
+    new_value->next = NULL;
+    node->v_head = new_value;
+  }
+
+  /*Push the value into the value "stack".*/
+  else {
+    new_value->next = node->v_head;
+    node->v_head = new_value;
+  }
+  return;
+}
+
+/*Frees up all the contents of a node*/
+void
+free_node(bst_node* node)
+{
+  v_node* temp_node; //current value to free
+  
+  /*First we need to free up the list of values*/
+  while(node->v_head != NULL) {
+    temp_node = node->v_head;
+    node->v_head = node->v_head->next;
+    free(temp_node->value);
+    free(temp_node);
+  }
+
+  /*Then the node itself*/
+  free(node);
+}
